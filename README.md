@@ -1,6 +1,6 @@
 # nim-libtorch-transformers
 
-A reference snapshot of the tattletale transformers inference stack in Nim, built on libtorch.
+A reference snapshot of the [tattletale](https://github.com/mratsim/tattletale) transformers inference stack in Nim, built on libtorch.
 This tree is an educational, self-contained copy of the working stack as it stood before its tensor-kernel migration.
 
 It carries the transformers package (models, layers, sampling, stateful KV cache), the libtorch binding it runs on, and the tokenizer.
@@ -9,6 +9,29 @@ It also carries the quantized weight formats and the utility packages they impor
 Each kept package travels with its own test suite.
 
 This tree is reference and educational material, not an active development tree, and not published as a package.
+
+## Model coverage
+
+The bf16 suites cover the families below with 01 layer internals,
+03 full forward to logits, and 04 greedy text generation per family with fixtures.
+
+| family | lab | tested variants |
+|---|---|---|
+| gemma | Google | 1b, 270m |
+| gemma | Google | 12B, 26B-A4B, E2B |
+| GLM | Zhipu AI (Z.ai) | GLM-4.7-Flash |
+| Kimi | Moonshot AI | Kimi-Linear-48B-A3B |
+| Laguna | Poolside.ai | Laguna-XS-2.1 |
+| Ling | InclusionAI (Ant Group) | Ling-3.0-tiny |
+| Mistral | Mistral AI | Mistral-7B-v0.1 |
+| Moonlight | Moonshot AI | Moonlight-16B-A3B |
+| North | Cohere | North-Mini-Code-1.0 |
+| Qwen3 | Alibaba (Qwen team) | 0.6B |
+| Qwen3.5 | Alibaba (Qwen team) | 0.8B |
+| Qwen3.6 | Alibaba (Qwen team) | 35B-A3B (MoE) |
+
+The EXL3 suites cover Qwen3-0.6B-EXL3-5bpw with 00 codec, 01 layer internals,
+03 full forward, and 04 greedy generation.
 
 ## Layout
 
@@ -89,29 +112,6 @@ Suites reach them through gitignored paths under `workspace/transformers/tests/h
   the checkpoint lives on the machine
 - the name must match what the test code opens
 - the exact placement is machine-local, nothing under `tests/hf_models/` is committed
-
-## Model coverage
-
-The bf16 suites cover the families below with 01 layer internals,
-03 full forward to logits, and 04 greedy text generation per family with fixtures.
-
-| family | tested variants |
-|---|---|
-| gemma-3 | 1b, 270m |
-| gemma-4 | 12B, 26B-A4B, E2B |
-| GLM | GLM-4.7-Flash |
-| Kimi | Kimi-Linear-48B-A3B |
-| Laguna | Laguna-XS-2.1 |
-| Ling | Ling-3.0-tiny |
-| Mistral | Mistral-7B-v0.1 |
-| Moonlight | Moonlight-16B-A3B |
-| North | North-Mini-Code-1.0 |
-| Qwen3 | 0.6B |
-| Qwen3.5 | 0.8B |
-| Qwen3.6 | 35B-A3B (MoE) |
-
-The EXL3 suites cover Qwen3-0.6B-EXL3-5bpw with 00 codec, 01 layer internals,
-03 full forward, and 04 greedy generation.
 
 ## Devices
 
