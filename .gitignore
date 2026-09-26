@@ -1,0 +1,55 @@
+# Build artifacts shall be put in an ignored build/ directory
+# Ignore dynamic, static libs and libtool archive files
+# -----------------------------------------------------------------------------------------
+build/
+*.so
+*.so.*
+*.dylib
+*.a
+*.lib
+*.la
+*.dll
+*.exe
+*.out
+
+# Nim
+# -----------------------------------------------------------------------------------------
+nimcache/
+
+# Vendored libtorch C++ distribution — fetched by
+# libtorch/vendor/libtorch_installer.nim, machine-local, never committed
+# (mirrors tattletale workspace/libtorch/.gitignore)
+libtorch/vendor/libtorch
+
+# Model checkpoints reach tests through gitignored symlinks into MODELS/
+# (outside the repo) — never commit links or anything under tests/hf_models
+# (mirrors tattletale tests/hf_models handling; a committed link is a leak)
+tests/hf_models/*
+
+# MacOS
+# -----------------------------------------------------------------------------------------
+*.dylib.dSYM/
+
+# Swap or debug
+# -----------------------------------------------------------------------------------------
+*.swp
+*~
+
+# Code editors & agents
+# -----------------------------------------------------------------------------------------
+.idea
+.vscode
+
+# Python devops
+# -----------------------------------------------------------------------------------------
+.venv
+.ruff_cache
+
+# Python artifacts
+# -----------------------------------------------------------------------------------------
+*.pt
+__pycache__/
+
+# Tokenizer caches fetched for toktoktok_tokenizer tests
+# -----------------------------------------------------------------------------------------
+toktoktok_tokenizer/tests/pytoktoktok.so
