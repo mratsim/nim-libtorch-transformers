@@ -16,15 +16,16 @@ build/
 # -----------------------------------------------------------------------------------------
 nimcache/
 
-# Vendored libtorch C++ distribution — fetched by
-# libtorch/vendor/libtorch_installer.nim, machine-local, never committed
+# Vendored workspace/libtorch C++ distribution — fetched by
+# workspace/libtorch/vendor/libtorch_installer.nim, machine-local, never committed
 # (mirrors tattletale workspace/libtorch/.gitignore)
-libtorch/vendor/libtorch
+workspace/libtorch/vendor/libtorch
 
-# Model checkpoints reach tests through gitignored symlinks into MODELS/
-# (outside the repo) — never commit links or anything under tests/hf_models
-# (mirrors tattletale tests/hf_models handling; a committed link is a leak)
-tests/hf_models/*
+# Model checkpoints are machine-local, placed or symlinked under
+# tests/hf_models by the machine's operator, never committed
+# (a committed link is a leak). Regenerate the links per machine.
+workspace/transformers/tests/hf_models/*
+!workspace/transformers/tests/hf_models/.gitkeep
 
 # MacOS
 # -----------------------------------------------------------------------------------------
@@ -49,7 +50,3 @@ tests/hf_models/*
 # -----------------------------------------------------------------------------------------
 *.pt
 __pycache__/
-
-# Tokenizer caches fetched for toktoktok_tokenizer tests
-# -----------------------------------------------------------------------------------------
-toktoktok_tokenizer/tests/pytoktoktok.so

@@ -1,0 +1,12 @@
+# HuggingFace models used for testing
+# -----------------------------------------------------------------------------------------
+tests/hf_models/*
+!tests/hf_models/.gitkeep
+
+# Tokenizer files are never committed. Model suites use the tokenizer kept
+# in the gitignored tests/hf_models/<Model>/ directory.
+tests/fixtures/**/tokenizer.json
+
+# Large weights
+# -----------------------------------------------------------------------------------------
+tattletale/workspace/transformers/tests/fixtures/bf16-01-layer-internals/Qwen3-0.6B-embed-lmhead/embed-lmhead-Qwen3-0.6B-01.safetensor

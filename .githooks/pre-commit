@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Pre-commit hook: routes the staged files to their linters.
+
+Routing (directory-specific through this script):
+
+- any staged .md or .nim file, plus everything under .agents/:
+  the doc-comment linter (lint_docs.py), the lint_docs rules scoped to
+  the lines the staged diff adds via --base, pre-existing prose stays
+  outside the gate
+- any staged .nim file under the kernel roots (positron kernels and
+  mega_kernels, ceramic src): the tile linter (lint_tiles.py), the tile
+  rules scoped to the lines the staged diff adds via --base the same
+  way, pre-existing sites stay outside the report
+- tests/testgen/gen_*.py: the generator linter (L2)
+- tests/fixtures/**: the fixture linter (L3)
+- tests/**/*.nim: the fixture-consumer linter (L4)
+
+A counted finding blocks the commit: fix the finding, never widen the
+linter to make a commit pass. The rules tables live in the linter
+headers; the writing rules live in .agents/skills/writing-docs/ plus
+the global writing-code-doc skill — read them, they are always
+forgotten.
+"""
+
+import os
+import subprocess
+import sys
+
+TESTS = os.path.join("workspace", "transformers", "tests")
+LINT_DIR = os.path.join(TESTS, "linters")
+DOC_LINT = os.path.join(".agents", "skills", "writing-docs", "tools", "lint_docs.py")
+TILE_LINT = os.path.join(".agents", "skills", "writing-docs", "tools", "lint_tiles.py")
+KERNEL_PREFIXES = (
+    os.path.join("workspace", "positron_kernels", "src", "kernels") + os.sep,
+)
+
+ROUTES = (
+    (os.path.join(TESTS, "testgen"), "gen_", "lint_gen_scripts.py"),
+    (os.path.join(TESTS, "fixtures"), "", "lint_fixtures.py"),
+)
+
+REPO = subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"],
+    capture_output=True, text=True).stdout.strip()
+if not REPO:
+    sys.exit("pre-commit: not inside a git repository")
+
+
+def changed_files():
+    """Lists staged add/copy/modify/rename paths relative to the repo root.
+
+    Renames are included: a moved file skips no gate, the scan reads the
+    post-rename path. Deleted paths (R with no post image, D) never
+    appear in the list.
+    """
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only",
+         "--diff-filter=ACMR", "-z"],
+        capture_output=True, text=True, cwd=REPO).stdout
+    return [f for f in out.split("\0") if f]
+
+
+def route(path):
+    """Returns the linter scripts responsible for one staged path."""
+    rel = os.path.relpath(path, REPO)
+    picked = []
+    if rel.endswith((".md", ".nim")) or rel.startswith(".agents" + os.sep):
+        picked.append(DOC_LINT)
+    for d, prefix, script in ROUTES:
+        if rel.startswith(d + os.sep):
+            if not prefix or os.path.basename(rel).startswith(prefix):
+                picked.append(os.path.join(LINT_DIR, script))
+    if rel.endswith(".nim") and rel.startswith(KERNEL_PREFIXES):
+        picked.append(TILE_LINT)
+    if (rel.startswith(TESTS + os.sep) and rel.endswith(".nim")
+            and os.sep + "fixtures" + os.sep not in rel
+            and os.sep + "linters" + os.sep not in rel
+            and os.sep + "testgen" + os.sep not in rel):
+        picked.append(os.path.join(LINT_DIR, "lint_nim_fixtures_consumers.py"))
+    if (rel.startswith("workspace" + os.sep + "transformers" + os.sep)
+            and rel.endswith((".nim", ".py"))):
+        picked.append(os.path.join(LINT_DIR, "lint_device_policy.py"))
+    return picked
+
+
+def main():
+    grouped = {}
+    for path in changed_files():
+        for script in route(path):
+            grouped.setdefault(script, []).append(path)
+    blocked = False
+    base = os.environ.get("DOC_LINT_BASE", "HEAD")
+    for script, paths in sorted(grouped.items()):
+        cmd = [sys.executable, script]
+        if script in (DOC_LINT, TILE_LINT):
+            cmd += ["--base", base]
+        cmd += paths
+        out = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
+        if out.returncode == 1:
+            blocked = True
+            sys.stdout.write(out.stdout)
+            sys.stderr.write(out.stderr)
+            print("pre-commit: %s failed on: %s" % (
+                os.path.basename(script), ", ".join(paths)))
+        elif out.returncode not in (0, 1):
+            print("pre-commit: %s errored (exit %d), fix before commit" % (
+                os.path.basename(script), out.returncode))
+            sys.stdout.write(out.stdout)
+            sys.stderr.write(out.stderr)
+            blocked = True
+    if blocked:
+        print("pre-commit: commit blocked, fix the findings (never widen the linter)")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,301 @@
+# Tattletale
+# Copyright (c) 2026 Mamy André-Ratsimbazafy
+# Licensed and distributed under either of
+#   * MIT license (license terms in the root directory or at http://opensource.org/licenses/MIT).
+#   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/LICENSE-2.0).
+# at your option. This file may not be copied, modified, or distributed except according to those terms.
+
+import
+  std/[complex, enumerate, macros, strformat],
+  # Internal
+  ./abi/std_cpp,
+  ./abi/c10,
+  ./abi/torch_tensors,
+  ./indexing_macros
+
+static: doAssert sizeof(int) == sizeof(int64), "Libtorch requires a 64-bit OS"
+
+# #######################################################################
+#
+#               Syntactic sugar for Torch and Nim interop
+#
+# #######################################################################
+
+# ArrayRefs
+# -----------------------------------------------------
+# libtorch/include/c10/util/ArrayRef.h
+
+# Note:
+#   templates do literal replacement,
+#   i.e. if you pass (echo "launch missiles"; [1, 2]) to
+#   ```
+#   template foo(oa: openArray[int]): IntArrayRef =
+#     init(IntArrayRef, oa[0].unsafeAddr, oa.len)
+#   ```
+#   launch missiles will be called twice.
+#
+#   So either assign `let oa = oa` in the template body
+#   or use a proc.
+#
+#   But we can't store an openArray in a let variable
+#   or return it from a proc without {.experimental: "views".}
+
+func getPtrLen(ar: IntArrayRef): (ConstPtr[int], int) {.inline.} =
+  # Indirection to ensure the input and potential side-effect/computation
+  # are only evaluated/done once
+  # Note: Clang doesn't like assigning to a temporary because it discards the const qualifier
+  # So we use an opaque ConstPtr type
+  (ar.data(), ar.size.int)
+
+template asNimView*(ar: IntArrayRef): openArray[int] =
+  # Ensure `ar` is only evaluated once to avoid double computation or double side-effects
+  let (p, len) = getPtrLen(ar)
+  toOpenArray(cast[ptr UncheckedArray[int]](p), 0, len - 1)
+
+func asTorchView*(oa: varargs[int]): IntArrayRef {.inline.} =
+  # libtorch only works (and actively checks) on 64-bit OSes.
+  init(IntArrayRef, oa[0].unsafeAddr, oa.len)
+
+func asTorchView*[T: not int](oa: openArray[T]): ArrayRef[T] {.inline.} =
+  init(ArrayRef[T], oa[0].unsafeAddr, oa.len)
+
+proc `$`*[T](ar: ArrayRef[T]): string {.inline.} =
+  `$`(ar.asNimView())
+
+func len*[T](ar: ArrayRef[T]): int {.inline.} =
+  # Nim idiomatic proc for seq
+  ar.size().int
+
+func `[]`*[T](ar: ArrayRef[T], idx: SomeInteger): T {.inline.} =
+  when compileOption("boundChecks"):
+    if idx < 0 or idx >= ar.len():
+      raise newException(
+        IndexDefect,
+        &"ArrayRef `[]` access out-of-bounds. Index constrained by 0 <= {idx} <= ArrayRef.len() = {ar.len()}.",
+      )
+  result = getAt(ar, idx)
+
+# Type map
+# -----------------------------------------------------
+func toScalarKind*(T: typedesc[SomeTorchType]): static ScalarKind =
+  ## Maps a Nim type to Torch scalar kind
+  when T is uint8 | byte:
+    kUint8
+  elif T is int8:
+    kInt8
+  elif T is int16:
+    kInt16
+  elif T is int32 or (T is int and sizeof(int) == sizeof(int32)):
+    kInt32
+  elif T is int64 or (T is int and sizeof(int) == sizeof(int64)):
+    kInt64
+  elif T is float32:
+    kFloat32
+  elif T is float64:
+    kFloat64
+  elif T is Complex[float32]:
+    kComplexF32
+  elif T is Complex[float64]:
+    kComplexF64
+  elif T is bool:
+    kBool
+  else:
+    {.error: "Unsupported type in libtorch: " & $T.}
+
+
+# Nim openarrays -> Torch Tensors
+# -----------------------------------------------------
+
+func getShapeImpl[T](shapeAccum: var seq[int], s: openarray[T]) =
+  ## Recurse until we have a non-seq / non-array underlying type.
+  shapeAccum.add(s.len)
+  when (T is seq | array):
+    shapeAccum.getShapeImpl(s[0])
+
+func getShape[T](s: openarray[T]): seq[int] =
+  ## Get the shape of nested seqs/arrays
+  ## Important ⚠: at each nesting level, only the length
+  ##   of the first element is used for the shape.
+  ##   Ensure before or after that seqs have the expected length
+  ##   or that the total number of elements matches the product of the dimensions.
+  result.getShapeImpl(s)
+
+macro getBaseType(T: typedesc): untyped =
+  # Get the base T of a seq[T] input
+  result = T.getTypeInst()[1]
+  while result.kind == nnkBracketExpr and (result[0].eqIdent"seq" or result[0].eqIdent"array"):
+    # We can also have nnkBracketExpr(Complex, float32)
+    if result[0].eqIdent"seq":
+      result = result[1]
+    else: # array
+      result = result[2]
+
+iterator flatIter[T](s: openarray[T]): auto {.noSideEffect.} =
+  ## Inline iterator on any-depth seq or array
+  ## Returns values in order
+  for item in s:
+    when item is array | seq:
+      for subitem in flatIter(item):
+        yield subitem
+    else:
+      yield item
+
+func toTorchTensor*[T: SomeTorchType](oa: openarray[T]): TorchTensor =
+  ## Convert an openarray to CPU Tensor (owning copy, not a view).
+  result = empty(asTorchView(oa.len), toScalarKind(T))
+  let data = result.data_ptr(T)
+  for i, val in oa.pairs:
+    data[i] = val
+
+func toTorchTensor*[T: seq | array](oa: openarray[T]): TorchTensor =
+  ## Convert an openarray of openarrays to a CPU Tensor
+  ##
+  ## Input:
+  ##      - A nested array or a seq
+  ## Result:
+  ##      - A view Tensor of the same shape
+  let shape = getShape(oa)
+  type BaseType = getBaseType(T)
+
+  result = empty(shape.asTorchView(), BaseType.toScalarKind())
+
+  let data = result.data_ptr(BaseType)
+  for i, val in enumerate(flatIter(oa)):
+    data[i] = val
+
+# TorchTensor -> Nim string
+# -----------------------------------------------------
+
+func toCppString*(t: TorchTensor): CppString =
+  ## Tensors don't have a `$` equivilent so we have to put it into
+  ## a ostringstream and convert it to a CppString.
+  {.emit:
+  """
+  std::ostringstream stream;
+  stream << `t`;
+  result = stream.str();
+  """
+  .}
+
+proc `$`*(t: TorchTensor): string =
+  "TorchTensor\n" & $(toCppString(t))
+
+# #######################################################################
+#
+#                        Public fancy indexers
+#
+# #######################################################################
+# Checkers func to Raise IndexDefect
+# -----------------------------------------------------------------------
+
+macro `[]`*(t: TorchTensor{call}, args: varargs[untyped]): untyped =
+  ## Slice a Tensor expression (ensure expression is only evaluated once)
+  ## Input:
+  ##   - a Tensor
+  ##   - and:
+  ##     - specific coordinates (``varargs[int]``)
+  ##     - or a slice (cf. tutorial)
+  ## Returns:
+  ##   - a value or a tensor corresponding to the slice
+  ##
+  ## Usage:
+  ##    - Basic indexing - foo[2, 3]
+  ##    - Basic indexing - foo[1+1, 2*2*1]
+  ##    - Basic slicing - foo[1..2, 3]
+  ##    - Basic slicing - foo[1+1..4, 3-2..2]
+  ##    - Span slices - foo[_, 3]
+  ##    - Span slices - foo[1.._, 3]
+  ##    - Span slices - foo[_..3, 3]
+  ##    - Span slices - foo[_.._, 3]
+  ##    - Stepping - foo[1..3\|2, 3]
+  ##    - Span stepping - foo[_.._|2, 3]
+  ##    - Span stepping - foo[_.._|+2, 3]
+  ##    - Span stepping - foo[1.._|1, 2..3]
+  ##    - Span stepping - foo[_..<4|2, 3]
+  ##    - Slicing until at n from the end - foo[0..^4, 3]
+  ##    - Span Slicing until at n from the end - foo[_..^2, 3]
+  ##    - Stepped Slicing until at n from the end - foo[1..^1|2, 3]
+  ##    - Slice from the end - foo[^1..0|-1, 3]
+  ##    - Slice from the end - expect non-negative step error - foo[^1..0, 3]
+  ##    - Slice from the end - foo[^(2*2)..2*2, 3]
+  ##    - Slice from the end - foo[^3..^2, 3]
+  let new_args = getAST(desugarSlices(args))
+
+  result = quote do:
+    let tmp = `t` # Ensure an expression is only evaluated once
+    slice_typed_dispatch(tmp, `new_args`)
+
+macro `[]`*(t: TorchTensor{`let`|`var`|`const`|lvalue|param}, args: varargs[untyped]): untyped =
+  ## Slice a Tensor variable
+  ## Input:
+  ##   - a Tensor
+  ##   - and:
+  ##     - specific coordinates (``varargs[int]``)
+  ##     - or a slice (cf. tutorial)
+  ## Returns:
+  ##   - a value or a tensor corresponding to the slice
+  ##
+  ## Usage:
+  ##    - Basic indexing - foo[2, 3]
+  ##    - Basic indexing - foo[1+1, 2*2*1]
+  ##    - Basic slicing - foo[1..2, 3]
+  ##    - Basic slicing - foo[1+1..4, 3-2..2]
+  ##    - Span slices - foo[_, 3]
+  ##    - Span slices - foo[1.._, 3]
+  ##    - Span slices - foo[_..3, 3]
+  ##    - Span slices - foo[_.._, 3]
+  ##    - Stepping - foo[1..3\|2, 3]
+  ##    - Span stepping - foo[_.._|2, 3]
+  ##    - Span stepping - foo[_.._|+2, 3]
+  ##    - Span stepping - foo[1.._|1, 2..3]
+  ##    - Span stepping - foo[_..<4|2, 3]
+  ##    - Slicing until at n from the end - foo[0..^4, 3]
+  ##    - Span Slicing until at n from the end - foo[_..^2, 3]
+  ##    - Stepped Slicing until at n from the end - foo[1..^1|2, 3]
+  ##    - Slice from the end - foo[^1..0|-1, 3]
+  ##    - Slice from the end - expect non-negative step error - foo[^1..0, 3]
+  ##    - Slice from the end - foo[^(2*2)..2*2, 3]
+  ##    - Slice from the end - foo[^3..^2, 3]
+  let new_args = getAST(desugarSlices(args))
+
+  result = quote do:
+    slice_typed_dispatch(`t`, `new_args`)
+
+proc pop(tree: var NimNode): NimNode {.compileTime.} =
+  ## varargs[untyped] consumes all arguments so the actual value should be popped
+  ## https://github.com/nim-lang/Nim/issues/5855
+  result = tree[tree.len-1]
+  tree.del(tree.len-1)
+
+macro `[]=`*(t: var TorchTensor, args: varargs[untyped]): untyped =
+  ## Modifies a tensor inplace at the corresponding location or slice
+  ##
+  ##
+  ## Input:
+  ##   - a ``var`` tensor
+  ##   - a location:
+  ##     - specific coordinates (``varargs[int]``)
+  ##     - or a slice (cf. tutorial)
+  ##   - a value:
+  ##     - a single value that will
+  ##       - replace the value at the specific coordinates
+  ##       - or be applied to the whole slice
+  ##     - an openarray with a shape that matches the slice
+  ##     - a tensor with a shape that matches the slice
+  ## Result:
+  ##   - Nothing, the tensor is modified in-place
+  ## Usage:
+  ##   - Assign a single value - foo[1..2, 3..4] = 999
+  ##   - Assign an array/seq of values - foo[0..1,0..1] = [[111, 222], [333, 444]]
+  ##   - Assign values from a view/Tensor - foo[^2..^1,2..4] = bar
+  ##   - Assign values from the same Tensor - foo[^2..^1,2..4] = foo[^1..^2|-1, 4..2|-1]
+
+  # varargs[untyped] consumes all arguments so the actual value should be popped
+  # https://github.com/nim-lang/Nim/issues/5855
+
+  var tmp = args
+  let val = tmp.pop()
+  let new_args = getAST(desugarSlices(tmp))
+
+  result = quote do:
+    slice_typed_dispatch_mut(`t`, `new_args`, `val`)

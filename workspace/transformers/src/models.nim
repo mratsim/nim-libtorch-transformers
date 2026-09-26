@@ -1,0 +1,150 @@
+# Tattletale
+# Copyright (c) 2026 Mamy André-Ratsimbazafy
+# Licensed and distributed under either of
+#   * MIT license (license terms in the root directory or at http://opensource.org/licenses/MIT).
+#   * Apache v2 license (license terms in http://www.apache.org/licenses/LICENSE-2.0).
+# at your option. This file may not be copied, modified, or distributed except according to those terms.
+
+## Models module - imports all model implementations and provides the generic loadModel proc
+##
+## Import order matters:
+## 1. all_interfaces - defines ModelRegistry and AnyModel iface
+## 2. Individual models (qwen3, etc.) - populate ModelRegistry via static blocks
+## 3. This file - uses ModelRegistry in loadModel (after it's populated)
+
+import ./models/all_reexports
+export all_reexports
+
+import std/json
+import std/os
+import std/tables
+import std/strutils
+import std/sequtils
+import workspace/libtorch as F
+import workspace/toktoktok
+import ./stateful/orchestrator
+import ./samplers
+import ./instrumentation
+
+proc loadModel*(modelPath: string, device: DeviceKind): AnyModel =
+  # Pass the compile-time -> runtime boundary
+  # and make the var {.compiletime.} a const at runtime
+  const registry = static(ModelRegistry)
+
+  let cfg = modelPath.joinPath("config.json").parseFile()
+  let archs = cfg["architectures"]
+
+  checkValue(archs.len != 0, "[ttt] No architectures found in config.json")
+
+  checkValue(archs.len <= 1, "[ttt] Multiple architectures not supported")
+
+  let arch = archs[0].getStr()
+
+  checkValue(registry.hasKey(arch), "[ttt] Unknown architecture: " & arch)
+
+  let loader = registry[arch]
+  loader(modelPath, device)
+
+func parseTorchDtype(s: string): ScalarKind =
+  ## Parse dtype string from config.json to ScalarKind enum.
+  ## Based on transformers dtype string format (lowercase).
+  case s.toLowerAscii()
+  of "bfloat16": kBfloat16
+  of "float16", "half": kFloat16
+  of "float32", "float": kFloat32
+  of "float64", "double": kFloat64
+  of "uint8", "byte": kUint8
+  of "int8", "char": kInt8
+  of "int16", "short": kInt16
+  of "int32", "int": kInt32
+  of "int64", "long": kInt64
+  of "bool": kBool
+  of "complexfloat16", "complexf16": kComplexF16
+  of "complexfloat32", "complexf32", "complexfloat": kComplexF32
+  of "complexfloat64", "complexf64", "complexdouble": kComplexF64
+  of "qint8": kQint8
+  of "quint8": kQuint8
+  of "qint32": kQint32
+  else:
+    raise newException(ValueError, "[ttt] Unknown torch_dtype: " & s)
+
+proc generate*(
+        model: AnyModel,
+        prompt: string,
+        temp = 1.0f,
+        maxTokens = 200,
+        maxContextLen: int = -1): string =
+  let cfg = model.getConfig()
+  let device = model.getDeviceKind()
+  let maxCtx = if maxContextLen < 0: cfg.max_position_embeddings else: maxContextLen
+  let numPoolPages = computeNumPages(maxCtx, concurrentRequests = 1)
+  let dtype = parseTorchDtype(cfg.torch_dtype)
+  var orc =
+    if cfg.mlaKvLoraRank > 0:
+      # MLA latent-cache pool: K the compressed latent, V the kpe plane,
+      # both single-head, the per-buffer-width shape the MLA mixers
+      # write through ctx.pages.
+      init(Orchestrator, cfg.num_hidden_layers, 1,
+           1, cfg.mlaKvLoraRank, 1, cfg.mlaKpeWidth,
+           maxCtx, numPoolPages, dtype, device)
+    else:
+      # The pool slots carry the widest per-head KV width, kvHeadDimMax,
+      # zero when head_dim governs. A dual-width checkpoint's full
+      # layers write full-width rows into the shared pool.
+      let headDim =
+        if cfg.kvHeadDimMax > 0: cfg.kvHeadDimMax else: cfg.head_dim
+      init(Orchestrator, cfg.num_hidden_layers, 1,
+           cfg.num_key_value_heads, maxCtx, headDim,
+           numPoolPages, dtype, device)
+  defer: orc.endSequence()
+
+  # Tokenize prompt with special tokens
+  var ids = model.getTokenizer().encode(prompt)
+
+  # guard against prompt exceeding max context length
+  checkValue(ids.len <= maxCtx,
+    "[ttt] Prompt length exceeds max context length: " & $ids.len & " > " & $maxCtx)
+
+  let startPos = ids.len
+
+  orc.startSequence(ids.mapIt(it.uint32))
+  # TODO: change tokenization to uint32/int32 directly — no point using 64-bit
+  #   when vocabulary is at most ~230K (fits in 2^18).
+  #   This would avoid the temporary seq allocation from mapIt.
+
+  # === PREFILL: forward on full prompt ===
+  let inputIds = F.toTensor([ids]).to(device)
+  let logits = model.forward(orc.getInferenceContextMut(), inputIds)
+  # kv_position must reflect total prefill tokens for correct decode page allocation
+  # TODO: review ownership and parameter passing of position parameter
+  orc.setKvPosition(ids.len)
+  let lastLogits = logits.narrow(1, startPos - 1, 1).squeeze(1)
+  var nextToken = sample(lastLogits, temp)
+  ids.add(nextToken)
+
+  # === DECODE LOOP: forward on 1 token at a time ===
+  while ids.len < startPos + maxTokens and ids.len < maxCtx:
+    # Set position for this decode step
+    # TODO: review ownership and parameter passing of position parameter
+    orc.appendToken(ids.len - 1, nextToken.uint32, device)
+    # Forward on single token: [1, 1]
+    let singleToken = F.toTensor([[nextToken]]).to(device)
+    let stepLogits = model.forward(orc.getInferenceContextMut(), singleToken)
+    # Advance kv_position AFTER forward — the attention layer used
+    # ctx.kv_position as the write offset (equal to position_ids.min())
+    # during this call, avoiding a GPU→CPU sync.  Now advance so the
+    # next appendToken's boundary check sees the updated total.
+    # TODO: review ownership and parameter passing of position parameter
+    orc.setKvPosition(ids.len)
+    # Sample next token from [1, 1, vocab] -> [vocab]
+    let stepLastLogits = stepLogits.squeeze(0).squeeze(0)
+    nextToken = sample(stepLastLogits, temp)
+    ids.add(nextToken)
+
+    stdout.write model.getTokenizer().decodeToString([ids[^1]])
+
+    if (cfg.eosTokenIds.len != 0 and ids[^1] in cfg.eosTokenIds) or
+        (cfg.eosTokenIds.len == 0 and ids[^1] == cfg.eosTokenId):
+      break
+
+  model.getTokenizer().decodeToString(ids)

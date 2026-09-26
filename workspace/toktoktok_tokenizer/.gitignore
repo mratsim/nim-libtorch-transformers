@@ -1,0 +1,5 @@
+# Tokenizers
+# -----------------------------------------------------------------------------------------
+tests/tokenizers/*.json
+tests/tokenizers/*.bpe
+tests/tokenizers/*.tiktoken

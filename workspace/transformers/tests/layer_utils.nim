@@ -1,0 +1,328 @@
+# Tattletale
+# Copyright (c) 2026 Mamy André-Ratsimbazafy
+# Licensed and distributed under either of
+#   * MIT license (license terms in the root directory or at http://opensource.org/licenses/MIT).
+#   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/MIT).
+#   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/LICENSE-2.0).
+# at your option. This file may not be copied, modified, or distributed except according to those terms.
+
+## Standardized helpers for the fixture-replay suites.
+##
+## One home for everything a suite repeats, split by consumer:
+##
+## - config document and weights shard of one model directory
+## - rotary table geometry read off the config text section
+## - the layer loads, composed over src/deserialization.nim
+##
+## - the chain's plain input-tensor preparation of the 04 suites
+## - per-layer fixture opens and checkpoint tensor counts of the 01/03 suites
+## - deterministic bf16-grid stimulus tensors and tensor comparisons
+
+import
+  std/importutils,
+  std/math,
+  std/os,
+  std/strutils,
+  std/tables,
+  pkg/packedjson,
+  workspace/libtorch as F,
+  workspace/positron,
+  workspace/safetensors,
+  workspace/safetensors/src/collections,
+  workspace/safetensors/src/safetensors {.all.},
+  workspace/safetensors/src/safetensors_libtorch,
+  workspace/transformers/src/layers,
+  workspace/transformers/src/deserialization,
+  workspace/transformers/src/layers/rope,
+  workspace/transformers/src/layers/attn_ssm/gated_delta_net,
+  workspace/transformers/src/layers/attn_ssm/multi_head_latent_attention,
+  workspace/transformers/src/quantizations/datatypes,
+  workspace/transformers/tests/harness/select_device
+
+export select_device.testDevice
+
+privateAccess(SafetensorObj)
+
+proc setup*(cfg: JsonNode, T: typedesc[RotaryPositionEmbedding],
+    maxSeqLen: int, dtype = F.kBFloat16,
+    device = F.kCPU): RotaryPositionEmbedding =
+  ## Builds the rotary table of one checkpoint over the first `maxSeqLen` positions, geometry read off the config text section.
+  ##
+  ## Contract:
+  ## - head_dim and rope_parameters.rope_theta name the table shape
+  ## - a partial rotary factor scales the rotating width down from head_dim
+  ## - the factor absent means full rotation
+  let t = if cfg.hasKey("text_config"): cfg{"text_config"} else: cfg
+  let headDim = t{"head_dim"}.getInt()
+  let thetaSrc = if cfg.hasKey("rope_parameters"): t{"rope_parameters"} else: t
+  let theta = thetaSrc{"rope_theta"}.getFloat(1e6)
+  let factor = thetaSrc{"partial_rotary_factor"}.getFloat(1.0)
+  let rotaryDim =
+    if factor > 0.0 and factor < 1.0:
+      round(headDim.float64 * factor).int
+    else:
+      headDim
+  RotaryPositionEmbedding.new(headDim, maxSeqLen, theta, dtype, device,
+    rotary_dim = rotaryDim)
+
+proc setup*(cfg: JsonNode,
+    T: typedesc[RopeElementWiseGatedAttention[RmsNormOne]],
+    weights: SafetensorsCollection, layerStem: string, layerIdx: int,
+    rotary: RotaryPositionEmbedding,
+    device = F.kCPU): RopeElementWiseGatedAttention[RmsNormOne] =
+  ## Loads checkpoint layer `layerIdx` as a RopeElementWiseGatedAttention
+  ## over RmsNormOne q/k norms, geometry read off the config text section.
+  ##
+  ## Expected input:
+  ## - layerStem, the layer path up to and including the dot separator,
+  ##   shaped "model.language_model.layers." - rotary, the table the KV
+  ##   context registers (the layer borrows it)
+  let t = if cfg.hasKey("text_config"): cfg{"text_config"} else: cfg
+  let prefix = layerStem & $layerIdx & ".self_attn"
+  RopeElementWiseGatedAttention[RmsNormOne].load(weights, cfg, prefix,
+    layerIdx,
+    t{"num_attention_heads"}.getInt(), t{"num_key_value_heads"}.getInt(),
+    t{"head_dim"}.getInt(), rotary, device)
+
+proc setupGatedDeltaNet*[Decay: static DecayAxis,
+    GateIn: FullRankGateIn | LowRankGateIn,
+    Form: static GateForm](cfg: JsonNode,
+    T: typedesc[GatedDeltaNet[Decay, GateIn, Form]],
+    weights: SafetensorsCollection, layerStem: string, layerIdx: int,
+    device = F.kCPU): GatedDeltaNet[Decay, GateIn, Form] =
+  ## Loads checkpoint layer `layerIdx` as a GatedDeltaNet, recurrent
+  ## geometry read off the config text section.
+  ##
+  ## Expected input:
+  ## - layerStem, the dot-terminated layer path stem, shaped
+  ##   model.language_model.layers. (weights load under linear_attn)
+  ## - T, the concrete mixer variant, e.g.
+  ##   GatedDeltaNet[perHead, FullRankGateIn, GateForm.softplus]
+  ##   for the Qwen3.5-family GDN layers
+  let t = if cfg.hasKey("text_config"): cfg{"text_config"} else: cfg
+  let prefix = layerStem & $layerIdx & ".linear_attn"
+  GatedDeltaNet[Decay, GateIn, Form].load(weights, cfg, prefix, layerIdx,
+    t{"linear_num_key_heads"}.getInt(), t{"linear_num_value_heads"}.getInt(),
+    t{"linear_key_head_dim"}.getInt(), t{"linear_value_head_dim"}.getInt(),
+    t{"linear_conv_kernel_dim"}.getInt(), device)
+
+proc setupGemma3LayerFixture*(weights: SafetensorsCollection, cfg: JsonNode,
+    layerIdx: int, rotary: RotaryPositionEmbedding, window: int,
+    softmaxScale: float64, device: F.DeviceKind):
+    (RopeGQAttention[RmsNormOne], RmsNormOne, RmsNormOne, RmsNormOne,
+    GatedDenseFFN, RmsNormOne) =
+  ## Loads gemma-3 decoder layer `layerIdx` from the open `weights` view,
+  ## exactly as the gemma-3 model file wires it, the mixer plus the four
+  ## sandwich norms and the gelu_pytorch_tanh dense block.
+  ##
+  ## Expected input:
+  ## - cfg, the flat gemma-3 text config (no text_config nesting)
+  ## - rotary, the dual-theta table the caller selects per layer kind,
+  ##   the local 1e4 theta on sliding layers, the global 1e6 theta on full
+  ## - softmaxScale, the query_pre_attn_scalar^-0.5 attention scale
+  let lp = "model.layers." & $layerIdx & "."
+  let attn = RopeGQAttention[RmsNormOne].load(
+    weights, cfg, lp & "self_attn", layerIdx,
+    cfg{"num_attention_heads"}.getInt(),
+    cfg{"num_key_value_heads"}.getInt(),
+    cfg{"head_dim"}.getInt(),
+    rotary, device,
+    window = window, softmaxScale = softmaxScale)
+  let inputLN = RmsNormOne.load(weights, cfg, lp & "input_layernorm", device)
+  let postLN = RmsNormOne.load(
+    weights, cfg, lp & "post_attention_layernorm", device)
+  let preFF = RmsNormOne.load(
+    weights, cfg, lp & "pre_feedforward_layernorm", device)
+  let ffn = GatedDenseFFN.load(weights, cfg, lp & "mlp", device,
+    activation = kGeluTanh)
+  let postFF = RmsNormOne.load(
+    weights, cfg, lp & "post_feedforward_layernorm", device)
+  (attn, inputLN, postLN, preFF, ffn, postFF)
+
+func nextStepRow*(logits: F.Tensor, position: int): F.Tensor =
+  ## Returns the [vocab] logit row at `position` of the sequence axis.
+  ##
+  ## Expected input:
+  ## - logits, the [batch, seq, vocab] tensor of one forward call
+  ## - the prefill pass hands prompt_len - 1, the last prompt position
+  ## - a decode step hands 0, its logits carry the single generated position
+  logits.narrow(1, position, 1).squeeze(1).squeeze(0)
+
+proc setupLayerFixture*(fixtureDir: string, layerIdx: int): Table[string, F.Tensor] =
+  ## Owned cpu tensor table of one per-layer `.safetensor` fixture, keyed by recorded tensor name.
+  let fixturePath = fixtureDir / "layer-" & ($layerIdx).align(2, '0') & ".safetensor"
+  var st = Safetensor.open(fixturePath)
+  result = initTable[string, F.Tensor]()
+  for name in st.tensors.keys():
+    result[name] = st.getTensorOwned(name, F.kCPU)
+
+proc setupLayerFixtureReader*(fixtureDir: string, layerIdx: int): Safetensor =
+  ## Opens one per-layer `.safetensor` fixture reader.
+  ## Contract, the returned reader owns its memory mapping, released after
+  ## the last reference to it goes away.
+  Safetensor.open(fixtureDir / "layer-" & ($layerIdx).align(2, '0') & ".safetensor")
+
+func setupMatrixTensor*(rows: seq[seq[float64]]): F.Tensor =
+  ## [rows, cols] fp32 tensor from equal-length numeric rows.
+  var flat = newSeq[float32]()
+  var cols = 0
+  for row in rows:
+    cols = row.len
+    for cell in row:
+      flat.add cell.float32
+  F.toTensor(flat).reshape(rows.len, cols)
+
+func setupIndicesTensor*(rows: seq[seq[int64]]): F.Tensor =
+  ## [rows, cols] int64 tensor of expert ids.
+  var flat = newSeq[int64]()
+  var cols = 0
+  for row in rows:
+    cols = row.len
+    flat.add row
+  F.toTensor(flat).reshape(rows.len, cols)
+
+proc ulpBf16*(m: float32): float32 {.inline.} =
+  ## One bf16 ulp at magnitude m (7 significand bits), zero maps to zero.
+  if m <= 0.0'f32:
+    return 0.0'f32
+  result = pow(2.0'f32, floor(log2(m)) - 7.0'f32)
+
+proc setupStimulusTensor*(rows, heads, width: int, offset: float32, device: F.DeviceKind): F.Tensor =
+  ## Deterministic bf16 stimulus of shape (1, rows, heads, width), values
+  ## sit on a 0.25-step grid anchored at the offset.
+  ##
+  ## Returns:
+  ## - the stimulus tensor, deterministic across reruns, so the invariance
+  ##   property sees no input rounding noise from the stimulus
+  var flat = newSeq[float32](rows * heads * width)
+  for i in 0 ..< flat.len:
+    flat[i] = offset + (float32(i mod 12) * 0.25'f32) - 1.25'f32
+  result = F.toTensor(flat).to(F.kBfloat16).to(device)
+    .reshape([1, rows, heads, width])
+
+# ── MLA (DeepSeek-style latent attention) ──────────────────────────────────
+
+func mlaInterleaveLayout*(x: F.Tensor): F.Tensor =
+  ## Recorded rotation output layout, the cat of the even and odd pair
+  ## values over the last dimension, the interleaved pair layout.
+  ##
+  ## Expected input:
+  ## - x, the (batch, seq, heads, plane) tensor whose plane channels
+  ##   sit in the half-split layout, pair i at channels (i, plane/2 + i)
+  ##
+  ## Output:
+  ## - the same shape with pair i at channels (2i, 2i + 1), pure data
+  ##   movement over the pair values
+  let d = x.size(3)
+  let even = x.narrow(3, 0, d div 2)
+  let odd = x.narrow(3, d div 2, d div 2)
+  F.cat([even.unsqueeze(4), odd.unsqueeze(4)], 4).reshape(
+    x.size(0), x.size(1), x.size(2), d)
+
+proc setupMlaDirect*[Pe](modelDir, prefix: string, layerIdx, maxSeq: int, device = F.kCPU): MLAttention[void, Pe] =
+  ## Direct-Q MLAttention load of checkpoint layer `layerIdx`
+  ## over the typed latent cache, wiring mirrored from the model files:
+  ## - geometry off the flat config.json section
+  ## - latent norm at the bottleneck eps
+  ## - softmax scale 1/sqrt(qk_head_dim)
+  ##
+  ## Expected input:
+  ## - modelDir, the checkpoint directory (config.json plus weight shards)
+  ## - prefix, the dot-terminated attention path, shaped "model.layers.N.self_attn."
+  ## - Pe, the rope policy the caller locks (FullRoPe or NoPe)
+  let cfgJson = packedjson.parseFile(modelDir / "config.json")
+  let view = SafetensorsCollection.open(modelDir)
+  let cache = MlaLatentCache.init(
+    cfgJson{"kv_lora_rank"}.getInt(), cfgJson{"qk_rope_head_dim"}.getInt(),
+    maxSeq, kBFloat16, device)
+  MLAttention[void, Pe].init(
+    layerIdx, prefix,
+    Linear.load(view, cfgJson, prefix & ".q_proj", device),
+    Linear.load(view, cfgJson, prefix & ".o_proj", device),
+    Linear.load(view, cfgJson, prefix & ".kv_a_proj_with_mqa", device),
+    RmsNorm.init(
+      view.getTensorOwned(prefix & ".kv_a_layernorm.weight", device),
+      qBF16, eps = BottleneckNormEps),
+    Linear.load(view, cfgJson, prefix & ".kv_b_proj", device),
+    numHeads = cfgJson{"num_attention_heads"}.getInt(),
+    qkNopeHeadDim = cfgJson{"qk_nope_head_dim"}.getInt(),
+    kvLoraRank = cfgJson{"kv_lora_rank"}.getInt(),
+    vHeadDim = cfgJson{"v_head_dim"}.getInt(),
+    softmaxScale = mlaSoftmaxScale(cfgJson{"qk_nope_head_dim"}.getInt(),
+      cfgJson{"qk_rope_head_dim"}.getInt()),
+    cache = cache)
+
+proc setupMlaCompressed*(modelDir, prefix: string, layerIdx, maxSeq: int, device = F.kCPU): MLAttention[RmsNorm, FullRoPe] =
+  ## Compressed-Q MLAttention load of checkpoint layer `layerIdx`
+  ## over the typed latent cache, wiring mirrored from the model files:
+  ## - q bottleneck plus both latent norms at the bottleneck eps
+  ## - softmax scale 1/sqrt(qk_head_dim)
+  ##
+  ## Expected input:
+  ## - modelDir, the checkpoint directory (config.json plus weight shards)
+  ## - prefix, the dot-terminated attention path, shaped "model.layers.N.self_attn."
+  let cfgJson = packedjson.parseFile(modelDir / "config.json")
+  let view = SafetensorsCollection.open(modelDir)
+  let cache = MlaLatentCache.init(
+    cfgJson{"kv_lora_rank"}.getInt(), cfgJson{"qk_rope_head_dim"}.getInt(),
+    maxSeq, kBFloat16, device)
+  MLAttention[RmsNorm, FullRoPe].init(
+    layerIdx, prefix,
+    q_a_proj = Linear.load(view, cfgJson, prefix & ".q_a_proj", device),
+    q_b_proj = Linear.load(view, cfgJson, prefix & ".q_b_proj", device),
+    q_a_norm = RmsNorm.init(
+      view.getTensorOwned(prefix & ".q_a_layernorm.weight", device),
+      qBF16, eps = BottleneckNormEps),
+    kv_a_proj_with_mqa = Linear.load(
+      view, cfgJson, prefix & ".kv_a_proj_with_mqa", device),
+    kv_a_layernorm = RmsNorm.init(
+      view.getTensorOwned(prefix & ".kv_a_layernorm.weight", device),
+      qBF16, eps = BottleneckNormEps),
+    kv_b_proj = Linear.load(view, cfgJson, prefix & ".kv_b_proj", device),
+    o_proj = Linear.load(view, cfgJson, prefix & ".o_proj", device),
+    numHeads = cfgJson{"num_attention_heads"}.getInt(),
+    qkNopeHeadDim = cfgJson{"qk_nope_head_dim"}.getInt(),
+    kvLoraRank = cfgJson{"kv_lora_rank"}.getInt(),
+    vHeadDim = cfgJson{"v_head_dim"}.getInt(),
+    softmaxScale = mlaSoftmaxScale(cfgJson{"qk_nope_head_dim"}.getInt(),
+      cfgJson{"qk_rope_head_dim"}.getInt()),
+    cache = cache)
+
+proc setupMlaGated*(modelDir, prefix: string, layerIdx, maxSeq: int, device = F.kCPU): HeadwiseGatedMLAttention[RmsNorm, FullRoPe] =
+  ## Head-wise gated MLAttention load of checkpoint layer `layerIdx`
+  ## over the typed latent cache, wiring mirrored from the model files:
+  ## - compressed-Q bottleneck, both latent norms at the bottleneck eps
+  ## - per-head sigmoid gate weight projection, the gate multiply
+  ##   sits before the output projection
+  ## - softmax scale 1/sqrt(qk_head_dim)
+  ##
+  ## Expected input:
+  ## - modelDir, the checkpoint directory (config.json plus weight shards)
+  ## - prefix, the dot-terminated attention path, shaped "model.layers.N.attention."
+  let cfgJson = packedjson.parseFile(modelDir / "config.json")
+  let view = SafetensorsCollection.open(modelDir)
+  let cache = MlaLatentCache.init(
+    cfgJson{"kv_lora_rank"}.getInt(), cfgJson{"qk_rope_head_dim"}.getInt(),
+    maxSeq, kBFloat16, device)
+  HeadwiseGatedMLAttention[RmsNorm, FullRoPe].init(
+    layerIdx, prefix,
+    q_a_proj = Linear.load(view, cfgJson, prefix & ".q_a_proj", device),
+    q_b_proj = Linear.load(view, cfgJson, prefix & ".q_b_proj", device),
+    q_a_norm = RmsNorm.init(
+      view.getTensorOwned(prefix & ".q_a_layernorm.weight", device),
+      qBF16, eps = BottleneckNormEps),
+    kv_a_proj_with_mqa = Linear.load(
+      view, cfgJson, prefix & ".kv_a_proj_with_mqa", device),
+    kv_a_layernorm = RmsNorm.init(
+      view.getTensorOwned(prefix & ".kv_a_layernorm.weight", device),
+      qBF16, eps = BottleneckNormEps),
+    kv_b_proj = Linear.load(view, cfgJson, prefix & ".kv_b_proj", device),
+    o_proj = Linear.load(view, cfgJson, prefix & ".dense", device),
+    g_proj = Linear.load(view, cfgJson, prefix & ".g_proj", device),
+    numHeads = cfgJson{"num_attention_heads"}.getInt(),
+    qkNopeHeadDim = cfgJson{"qk_nope_head_dim"}.getInt(),
+    kvLoraRank = cfgJson{"kv_lora_rank"}.getInt(),
+    vHeadDim = cfgJson{"v_head_dim"}.getInt(),
+    softmaxScale = mlaSoftmaxScale(cfgJson{"qk_nope_head_dim"}.getInt(),
+      cfgJson{"qk_rope_head_dim"}.getInt()),
+    cache = cache)
